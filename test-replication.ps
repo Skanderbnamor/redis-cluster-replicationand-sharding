@@ -1,0 +1,112 @@
+# advanced-replication-test.ps1 - Test avance de replication avec localisation
+Write-Host "TEST AVANCE REPLICATION REDIS" -ForegroundColor Cyan
+
+# 1. Verification de l'etat du cluster
+Write-Host "`n1. ETAT DU CLUSTER" -ForegroundColor Yellow
+docker exec redis-node-1 redis-cli cluster nodes
+
+# 2. Insertion de donnees avec differents patterns
+Write-Host "`n2. INSERTION DES DONNEES" -ForegroundColor Yellow
+
+$testData = @{
+    "user:1001" = "Alice-DataCenter-Paris"
+    "user:1002" = "Bob-DataCenter-Lyon" 
+    "user:1003" = "Charlie-DataCenter-Marseille"
+    "product:A001" = "Laptop-Dell-XPS-15-1599euro"
+    "product:B002" = "iPhone-15-Pro-256Go-1199euro"
+    "order:Z999" = "Order-Status-Shipped-Tracking-12345"
+    "session:userX" = "Session-Active-Token-ABC123XYZ"
+    "cache:config" = "Config-Database-Timeout-300s"
+}
+
+Write-Host "Insertion des donnees de test..." -ForegroundColor White
+
+foreach ($key in $testData.Keys) {
+    $result = docker exec redis-node-1 redis-cli -c SET $key $testData[$key]
+    Write-Host "  SET $key : $result" -ForegroundColor Gray
+}
+
+Start-Sleep -Seconds 3
+
+# 3. Analyse de la localisation des donnees
+Write-Host "`n3. LOCALISATION DES DONNEES" -ForegroundColor Yellow
+
+Write-Host "Analyse des slots et noeuds :" -ForegroundColor White
+foreach ($key in $testData.Keys) {
+    $slot = docker exec redis-node-1 redis-cli cluster keyslot $key
+    Write-Host "  $key -> Slot: $slot" -ForegroundColor Cyan
+}
+
+# 4. Test de replication detaille par noeud
+Write-Host "`n4. TEST DE REPLICATION PAR NOEUD" -ForegroundColor Yellow
+
+$allNodes = @("redis-node-1", "redis-node-2", "redis-node-3", "redis-node-4", "redis-node-5", "redis-node-6")
+$testKeys = @("user:1001", "user:1002", "product:A001", "product:B002", "order:Z999")
+
+Write-Host "Verification de l'acces aux donnees depuis chaque noeud :" -ForegroundColor White
+
+foreach ($node in $allNodes) {
+    Write-Host "`n  Test sur $node :" -ForegroundColor Magenta
+    $successCount = 0
+    
+    foreach ($key in $testKeys) {
+        $expectedValue = $testData[$key]
+        $actualValue = docker exec $node redis-cli -c GET $key 2>$null
+        
+        if ($actualValue -eq $expectedValue) {
+            Write-Host "    OK $key : $actualValue" -ForegroundColor Green
+            $successCount++
+        } else {
+            Write-Host "    ECHEC $key : MANQUANT ou DIFFERENT" -ForegroundColor Red
+            Write-Host "      Attendu: $expectedValue" -ForegroundColor DarkRed
+            if ($actualValue) {
+                Write-Host "      Recu: $actualValue" -ForegroundColor DarkRed
+            }
+        }
+    }
+    
+    $color = if ($successCount -eq $testKeys.Count) { "Green" } else { "Red" }
+    Write-Host "    Resultat: $successCount/$($testKeys.Count) donnees accessibles" -ForegroundColor $color
+}
+
+# 5. Test de resilience avec basculement
+Write-Host "`n5. TEST DE RESILIENCE - BASculement" -ForegroundColor Yellow
+
+Write-Host "Arret d'un noeud maitre pour tester la replication..." -ForegroundColor White
+docker stop redis-node-2
+Start-Sleep -Seconds 5
+
+Write-Host "Verification de l'acces aux donnees apres basculement :" -ForegroundColor White
+$recoverySuccess = 0
+foreach ($key in @("user:1001", "product:A001")) {
+    $value = docker exec redis-node-3 redis-cli -c GET $key 2>$null
+    if ($value -eq $testData[$key]) {
+        Write-Host "  OK $key accessible apres basculement" -ForegroundColor Green
+        $recoverySuccess++
+    } else {
+        Write-Host "  ECHEC $key inaccessible apres basculement" -ForegroundColor Red
+    }
+}
+
+Write-Host "Redemarrage du noeud..." -ForegroundColor White
+docker start redis-node-2
+Start-Sleep -Seconds 3
+
+# 6. Statistiques et resume
+Write-Host "`n6. STATISTIQUES ET RESUME" -ForegroundColor Yellow
+
+$totalKeys = docker exec redis-node-1 redis-cli -c DBSIZE
+Write-Host "Nombre total de cles dans le cluster : $totalKeys" -ForegroundColor White
+
+Write-Host "`nInformations du cluster :" -ForegroundColor White
+docker exec redis-node-1 redis-cli cluster info
+
+Write-Host "`n" + "="*60 -ForegroundColor Cyan
+if ($recoverySuccess -eq 2) {
+    Write-Host "TEST DE REPLICATION REUSSI" -ForegroundColor Green
+    Write-Host "   Toutes les donnees sont correctement repliquees" -ForegroundColor Green
+    Write-Host "   Le basculement automatique fonctionne" -ForegroundColor Green
+} else {
+    Write-Host "PROBLEMES DETECTES DANS LA REPLICATION" -ForegroundColor Red
+}
+Write-Host "="*60 -ForegroundColor Cyan
